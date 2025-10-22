@@ -75,4 +75,4 @@ for epoch in range(80):
         torch.cuda.empty_cache()
     scheduler1.step()
     if epoch%5==0:
-        torch.save(mlpnet.state_dict(), "/public/sdc/tangyingzhi/gsdiff3/ckpts/dp_diff_refinenet3_"+str(epoch)+".ckpt")
+        torch.save(mlpnet.state_dict(), "diff_refinenet_"+str(epoch)+".ckpt")
