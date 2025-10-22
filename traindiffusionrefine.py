@@ -11,7 +11,7 @@ from torch.optim.lr_scheduler import StepLR
 import pytorch3d 
 import pytorch3d.ops
 
-from model.pointnet2refinement import PointNet2SemSegSSGwithPE3
+from model.pointnet2refinement import PointNet2SemSegSSGwithPERefine
 
 train_dataset = DiffREfineDataset()
     
@@ -20,7 +20,7 @@ train_data_loader = DataLoader(train_dataset,
                     num_workers=4, pin_memory=True)
 
 
-mlpnet = PointNet2SemSegSSGwithPERe()
+mlpnet = PointNet2SemSegSSGwithPERefine()
 
 
 mlpnet = mlpnet.cuda()
