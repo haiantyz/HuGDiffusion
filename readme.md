@@ -25,3 +25,14 @@ python traindiffusion.py
 python traindiffusionrefine.py
 
 ```
+
+Please cite our paper.
+```
+@article{tang2025human,
+  title={HuGDiffusion: Generalizable Single-Image Human Rendering via 3D Gaussian Diffusion  },
+  author={Tang, Yingzhi and Zhang, Qijian and  and Hou, Junhui},
+  journal={IEEE Transactions on Visualization and Computer Graphics},
+  year={2025},
+  publisher={IEEE}
+}
+```
