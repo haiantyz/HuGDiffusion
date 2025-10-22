@@ -43,7 +43,7 @@ for epoch in range(80):
         scalegt = scalegt.cuda()
         imageo = imageo.float().cuda()
         backimageo =backimageo.float().cuda()
-        # print(scalegt.shape)
+      
         rotationgt = rotationgt.cuda()
         opacitygt = opacitygt.cuda()
         smpldist = smpldist.float().cuda() 
@@ -60,7 +60,7 @@ for epoch in range(80):
         # print(dist.shape)
         dgcnninput = torch.cat([query_knn_pc[:,:,1:,:]-gspc.unsqueeze(2).repeat(1,1,20,1), gspc.unsqueeze(2).repeat(1,1,20,1)],3).permute(0,3,1,2)
         
-        shs_dc_off, shs_rest_pred, scale, rotation, opacity = mlpnet(gspc, projectpc, image, imageo, projectpcback, backimage, backimageo, idx, part, prior_shs, dist, dgcnninput, smpldist)
+        shs_dc_off, shs_rest_pred, scale, rotation, opacity = mlpnet(gspc, projectpc, image, imageo, projectpcback, backimage, backimageo, idx, part, prior_shs, dist, dgcnninput, smpldist, True)
 
         predshs = torch.cat([prior_shs+shs_dc_off, shs_rest_pred], 2)
         
