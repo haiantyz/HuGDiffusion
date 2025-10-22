@@ -1,10 +1,3 @@
-"""
-Point Transformer - V3 Mode1
-Pointcept detached version
-
-Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
-Please cite our work if the code is helpful to you.
-"""
 
 import sys
 from functools import partial
@@ -1616,7 +1609,305 @@ def calc_t_emb(ts, t_emb_dim):
     t_emb = torch.cat((torch.sin(t_emb), torch.cos(t_emb)), 1)
     
     return t_emb
-   
+
+class PointNet2SemSegSSGwithPERefine(PointNet2ClassificationSSG):
+    def _build_model(self):
+        self.SA_modules = nn.ModuleList()
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=4096,
+                radius=0.02,
+                nsample=32,
+                mlp=[225+16, 64, 64, 64],
+                use_xyz=True,
+            )
+        )
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=2048,
+                radius=0.04,
+                nsample=32,
+                mlp=[64, 64, 64, 128],
+                use_xyz=True,
+            )
+        )
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=128,
+                radius=0.08,
+                nsample=32,
+                mlp=[128, 128, 128, 256],
+                use_xyz=True,
+            )
+        )
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=32,
+                radius=0.2,
+                nsample=32,
+                mlp=[256, 256, 256, 512],
+                use_xyz=True,
+            )
+        )
+        self.pelayer, _  = get_embedder(10)
+        self.global_feature_layer = PointnetSAModule(
+                mlp=[512, 512, 256, 64], use_xyz=True
+            )
+        self.FP_modules = nn.ModuleList()
+        self.FP_modules.append(PointnetFPModule(mlp=[128 + 225+16, 128, 128, 128]))
+        self.FP_modules.append(PointnetFPModule(mlp=[256 + 64, 256, 128]))
+        self.FP_modules.append(PointnetFPModule(mlp=[256 + 128, 256, 256]))
+        self.FP_modules.append(PointnetFPModule(mlp=[512 + 256, 256, 256]))
+        
+
+        self.attentionmodule = Attention2D()
+
+        self.shsprior1 = torch.nn.Conv1d(3, 16, 1)
+        self.shsprior2 = torch.nn.Conv1d(16, 32, 1)
+        self.shsprior3 = torch.nn.Conv1d(32, 32, 1)
+
+        self.shs_mlp_dc0 = nn.Conv1d(468, 256, 1)
+        self.shs_mlp_dc1 = nn.Conv1d(256, 64, 1)
+        self.shs_mlp_dc2 = nn.Conv1d(64, 32, 1)
+        self.shs_mlp_dc = nn.Conv1d(32, 3, 1)
+
+        self.shs_mlp_rest0 = nn.Conv1d(436, 256, 1)
+        self.shs_mlp_rest1 = nn.Conv1d(256, 128, 1)
+        self.shs_mlp_rest2 = nn.Conv1d(128, 64, 1)
+        self.shs_mlp_rest = nn.Conv1d(64, 45, 1)
+
+        self.resnet1 = resnet18(pretrained=True)
+        self.resnet2 = resnet18(pretrained=True)
+
+        self.upsample = torch.nn.Upsample(scale_factor=2, mode='bilinear')
+
+        nn.init.kaiming_uniform_(self.shs_mlp_dc.weight)
+        nn.init.constant_(self.shs_mlp_dc.bias,-1)
+        nn.init.kaiming_uniform_(self.shs_mlp_rest.weight)
+        nn.init.constant_(self.shs_mlp_rest.bias,0)
+
+        self.idxem = torch.nn.Conv1d(21, 16, 1)
+        self.idxem2 = torch.nn.Conv1d(16, 16, 1)
+        self.idxem3 = torch.nn.Conv1d(16, 16, 1)
+
+        self.distem = torch.nn.Conv1d(21, 16, 1)
+        self.distem2 = torch.nn.Conv1d(16, 16, 1)
+        self.distem3 = torch.nn.Conv1d(16, 16, 1)
+
+        self.partem = torch.nn.Conv1d(84, 64, 1)
+        self.partem2 = torch.nn.Conv1d(64, 32, 1)
+        self.partem3 = torch.nn.Conv1d(32, 16, 1)
+
+        self.scale_mlp = nn.Conv1d(521, 128, 1)
+        self.scale_mlp1 = nn.Conv1d(213, 64, 1)
+        self.scale_mlp2 = nn.Conv1d(149, 3, 1)
+        nn.init.kaiming_uniform_(self.scale_mlp2.weight)
+        nn.init.constant_(self.scale_mlp2.bias, -5)
+
+        self.rotation_mlp = nn.Conv1d(521, 128 , 1)
+        self.rotation_mlp1 = nn.Conv1d(213, 64 , 1)
+        self.rotation_mlp2 = nn.Conv1d(149, 4 , 1)
+        nn.init.kaiming_uniform_(self.rotation_mlp2.weight)
+        nn.init.constant_(self.rotation_mlp2.bias, 0)
+        nn.init.constant_(self.rotation_mlp2.bias[0], 1.0)
+
+        self.opacity_mlp = nn.Conv1d(436, 1, 1)
+        
+        
+        self.leaky_relu = nn.LeakyReLU()
+        self.bn1 = nn.BatchNorm2d(64)
+        self.convdgcnn = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+                                   self.bn1,
+                                   nn.LeakyReLU(negative_slope=0.2))
+
+    def forward(self, gspc, projectpc, image, imageo, projectpcback, backimage, backimageo, smplidx, smplpart, prior_shs, sdist, dgcnninput, smpldist, istrain):
+        r"""
+            Forward pass of the network
+
+            Parameters
+            ----------
+            pointcloud: Variable(torch.cuda.FloatTensor)
+                (B, N, 3 + input_channels) tensor
+                Point cloud to run predicts on
+                Each point in the point-cloud MUST
+                be formated as (x, y, z, features...)
+        """
+        RT = np.asarray([1,0,0,0,0,0,-1,0,0,1,0,3.1]).reshape(3,4)
+
+        R = RT[:,:3]
+        T = RT[:,-1].reshape(-1, 1)
+        K= np.array([[
+            711.111083984375,
+            0.0,
+            256.0
+        ],
+        [
+            0.0,
+            711.111083984375,
+            256.0
+        ],
+        [
+            0.0,
+            0.0,
+            1.0
+        ]])
+
+        R = torch.from_numpy(R).unsqueeze(0).cuda()
+        T = torch.from_numpy(T).unsqueeze(0).cuda()
+        K = torch.from_numpy(K).unsqueeze(0).cuda()
+        rgbfeature = imageo
+        
+        imagefeature = self.resnet1(image)
+        # imagefeature = self.upsample(imagefeature)
+
+        backrgbfeature = backimageo
+        if istrain:
+            backimagefeature = self.resnet2(backimage)
+        else:
+            backimagefeature = self.resnet1(backimage)
+        # backimagefeature = self.upsample(backimagefeature)
+        
+        frontfeature = torch.cat([rgbfeature, imagefeature], 1)
+        backfeature = torch.cat([backrgbfeature, backimagefeature],1)
+        # imagefeaturecombine = torch.cat([rgbfeature, backrgbfeature,imagefeature,backimagefeature],1)
+        bs = gspc.shape[0]
+        mlpinput = torch.tensor([]).cuda()
+        for i in range(bs):
+            _, visible_idx = points_projection(projectpc[i].unsqueeze(0), frontfeature[i].unsqueeze(0))
+            pcv = gspc[i][visible_idx]
+            uniqueidx = set(list(visible_idx.cpu().numpy()))
+            allidx = set(range(20000))
+            unvisible = torch.from_numpy(np.asarray(list(set(allidx).difference(set(uniqueidx))))).cuda()
+
+            visiblepc = projectpcback[i][visible_idx].unsqueeze(0)
+            unvisiblepc = projectpcback[i][unvisible].unsqueeze(0)
+            unvisiblepcssda =  torch.cat([unvisiblepc[:,:,:1],unvisiblepc[:,:,-1:]],2)
+            visiblepcssda = torch.cat([visiblepc[:,:,:1],visiblepc[:,:,-1:]],2)
+            dist, idx, query_knn_pc=pytorch3d.ops.knn_points(unvisiblepcssda, visiblepcssda,K=1,return_nn=True,return_sorted=False)
+            unvisiblepc = unvisiblepc.squeeze()
+            visiblepc = visiblepc.squeeze()
+            # print(visible_idx.shape)
+            # print(unvisible.shape)
+            newallidx = torch.cat([visible_idx, unvisible], 0)
+            newz = visiblepc[:,1][idx.squeeze().cpu().numpy()]
+            
+            newunviprojectpc = torch.cat([unvisiblepc[:,:1],newz.squeeze().unsqueeze(-1),unvisiblepc[:,-1:]],1).squeeze().unsqueeze(0)
+            # pcd = o3d.geometry.PointCloud()
+            # pcd.points = o3d.utility.Vector3dVector(newunviprojectpc.detach().cpu().squeeze().numpy())
+            
+            # o3d.io.write_point_cloud("test.ply", pcd)
+            visiblepc = visiblepc.squeeze().unsqueeze(0)
+            # projected_featuresu, _ = points_projection(newunviprojectpc.unsqueeze(0), backfeature[i].unsqueeze(0), 0.0075,10)
+            nu_uv = projection(newunviprojectpc, R,T,K)
+            nu_uv = 2.0 * nu_uv.type(torch.float32) / torch.Tensor([512, 512]).cuda() - 1.0
+            projected_featuresu = F.grid_sample(backfeature[i].unsqueeze(0), nu_uv, mode='nearest', align_corners=True).squeeze().permute(1,0)
+            uv =  projection(visiblepc, R,T,K)
+            uv = 2.0 * uv.type(torch.float32) / torch.Tensor([512, 512]).cuda()  - 1.0
+            projected_featuresv = F.grid_sample(frontfeature[i].unsqueeze(0), uv, mode='nearest', align_corners=True).squeeze().permute(1,0)
+            pc = gspc[i]
+            feat = torch.cat([projected_featuresv, projected_featuresu],0).squeeze()
+            
+            correctsortfeat = torch.zeros_like(feat).cuda()
+            correctsortfeat[newallidx] = feat
+            
+            pcpe = self.pelayer(pc)
+            colorpe = self.pelayer(correctsortfeat[...,:3])
+            tmp = torch.concat([pc,pcpe, colorpe, correctsortfeat],1).unsqueeze(0)
+            mlpinput = torch.cat([mlpinput, tmp], 0)
+        
+        smplidx = self.pelayer(smplidx)
+        
+        smplidx = smplidx.permute(0,2,1)
+        smplidx = smplidx.float()
+        idxlatten = F.leaky_relu(self.idxem(smplidx))
+        idxlatten = F.leaky_relu(self.idxem2(idxlatten))
+        idxlatten = torch.sigmoid(self.idxem3(idxlatten))
+        idxlatten = idxlatten.permute(0,2,1)
+        smpldist = self.pelayer(smpldist)
+        smpldist = smpldist.permute(0,2,1)
+        distlatten = F.leaky_relu(self.distem(smpldist))
+        distlatten = F.leaky_relu(self.distem2(distlatten))
+        distlatten = F.leaky_relu(self.distem3(distlatten))
+        distlatten = distlatten.permute(0,2,1)
+        smplpart = self.pelayer(smplpart)
+        smplpart = smplpart.permute(0,2,1)
+        partlatten = F.leaky_relu(self.partem(smplpart))
+        partlatten = F.leaky_relu(self.partem2(partlatten))
+        partlatten = F.leaky_relu(self.partem3(partlatten))
+        
+        partlatten = partlatten.permute(0,2,1)
+        # print(mlpinput.shape)
+        # print(distlatten.shape)
+        # print(partlatten.shape)
+        # print(idxlatten.shape)
+        mlpinput = torch.cat([mlpinput, partlatten, idxlatten, distlatten], 2)
+        print(mlpinput.shape)
+        bs = mlpinput.shape[0]
+        ptsnum = mlpinput.shape[1]
+        xyz, features = self._break_up_pc(mlpinput)
+
+        l_xyz, l_features = [xyz], [features]
+        for i in range(len(self.SA_modules)):
+            li_xyz, li_features = self.SA_modules[i](l_xyz[i], l_features[i])
+            l_xyz.append(li_xyz)
+            l_features.append(li_features)
+            
+        _, globalfeature = self.global_feature_layer(l_xyz[-1], l_features[-1])
+        
+        globalfeature = globalfeature.repeat(1,1,ptsnum)
+
+        for i in range(-1, -(len(self.FP_modules) + 1), -1):
+            l_features[i - 1] = self.FP_modules[i](
+                l_xyz[i - 1], l_xyz[i], l_features[i - 1], l_features[i]
+            )
+        
+        pred_feature = l_features[0]
+        pred_feature= torch.cat([pred_feature, globalfeature],1)
+        dgcnnfeature = self.convdgcnn(dgcnninput)
+        dgcnnfeature = dgcnnfeature.max(dim=-1, keepdim=False)[0]
+        
+        
+        finalinput = torch.cat([mlpinput.permute(0,2,1),pred_feature],1)
+        
+        finalinput = finalinput.permute(0,2,1)
+        finalinput = self.attentionmodule(finalinput)
+        finalinput = finalinput.permute(0,2,1)
+
+        # print(prior_shs.shape)
+        # print(finalinput.shape)
+        prior_shssxx = self.leaky_relu(self.shsprior1(prior_shs.permute(0,2,1)))
+        prior_shssxx = self.leaky_relu(self.shsprior2(prior_shssxx))
+        prior_shssxx = self.leaky_relu(self.shsprior3(prior_shssxx))
+        shs_dc = self.leaky_relu(self.shs_mlp_dc0(torch.cat([finalinput, prior_shssxx],1)))
+        shs_dc = self.leaky_relu(self.shs_mlp_dc1(shs_dc))
+        shs_dc = self.leaky_relu(self.shs_mlp_dc2(shs_dc))
+        shs_dc = (self.shs_mlp_dc(shs_dc))
+
+        shs_rest = self.leaky_relu(self.shs_mlp_rest0(finalinput))
+        shs_rest = self.leaky_relu(self.shs_mlp_rest1(shs_rest))
+        shs_rest = self.leaky_relu(self.shs_mlp_rest2(shs_rest))
+        shs_rest = 0.5*F.tanh(self.shs_mlp_rest(shs_rest))
+
+        shs = torch.cat([shs_dc, shs_rest],1)
+        
+        scaleinput = torch.cat([finalinput,sdist.permute(0,2,1),dgcnnfeature],1)
+        scale1 = self.leaky_relu(self.scale_mlp(scaleinput))
+        scaleinput2 = torch.cat([scale1,sdist.permute(0,2,1),dgcnnfeature],1)
+        scale1 = self.leaky_relu(self.scale_mlp1(scaleinput2))
+        scaleinput3 = torch.cat([scale1,sdist.permute(0,2,1),dgcnnfeature],1)
+        scale = torch.nn.Softplus()(self.scale_mlp2(scaleinput3))
+
+        rotationinput = torch.cat([finalinput, sdist.permute(0,2,1), dgcnnfeature],1)
+        rotation1 = self.leaky_relu(self.rotation_mlp(rotationinput))
+        rotationinput2 = torch.cat([rotation1, sdist.permute(0,2,1), dgcnnfeature],1)
+        rotation2 = self.leaky_relu(self.rotation_mlp1(rotationinput2))
+        rotationinput3 = torch.cat([rotation2, sdist.permute(0,2,1), dgcnnfeature],1)
+  
+        rotation = torch.nn.functional.normalize(self.rotation_mlp2(rotationinput3))
+
+        opacity = torch.sigmoid(self.opacity_mlp(finalinput))
+        
+        return shs_dc.permute(0,2,1).reshape(bs, ptsnum, 3), shs_rest.permute(0,2,1).reshape(bs, ptsnum, 45),  scale.permute(0,2,1), rotation.permute(0,2,1), opacity.permute(0,2,1)
 
 
 
