@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data
 from dataset import TrainDataset1
-from model.pointnet2diffusion import PointNet2SemSegSSGwithPE7
+from model.pointnet2diffusion import PointNet2SemSegSSGwithPEDiffusion
 import argparse
 from torch.distributions import Normal
 import os
@@ -420,7 +420,7 @@ class Model(nn.Module):
         assert data.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
 
-        out = self.model(gspc, projectpc, image, imageo, projectpcback, backimage, backimageo, person, idx, dist, part, data, t)
+        out = self.model(gspc, projectpc, image, imageo, projectpcback, backimage, backimageo, person, idx, dist, part, data, t, True)
 
         assert out.shape == torch.Size([B, D, N])
         return out
