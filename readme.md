@@ -16,4 +16,3 @@ python unifyalign_secondstage.py
 python unifyalign_inference.py
 ```
 
-The official pytorch implement of HuGDiffusion.
