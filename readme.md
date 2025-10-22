@@ -11,6 +11,9 @@ python overfit_firststage.py
 
 # second stage all person overfitting. At this stage, you will achieve a ckpt file first.
 python unifyalign_secondstage.py
+
+# load the ckpt file and run the inference py file you will achieve a distribution unified proxy 3dgs dataset.
+python unifyalign_inference.py
 ```
 
 The official pytorch implement of HuGDiffusion.
