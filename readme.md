@@ -16,4 +16,4 @@ python unifyalign_secondstage.py
 python unifyalign_inference.py
 ```
 
-Please follow [HaP](https://github.com/yztang4/HaP/tree/main) to generate the human point cloud. 
+Please follow [HaP](https://github.com/yztang4/HaP/tree/main) to generate the human point cloud. Please reffer to [instructpix2pix](https://github.com/timothybrooks/instruct-pix2pix), [controlnet](https://github.com/lllyasviel/ControlNet), [SiTH](https://github.com/SiTH-Diffusion/SiTH) and [PSHuman](https://github.com/pengHTYX/PSHuman) for generating the backside view images.
