@@ -124,14 +124,14 @@ def training(dataset, opt, pipe, lp, args, testing_iterations, saving_iterations
     pe_layerv1, _ = get_embedder(2)
 
     
-    pcinput = torch.from_numpy(np.load("")).cuda().float()
+    pcinput = torch.from_numpy(np.load("")).cuda().float() # shape 20000,3
     pcinputpe = pe_layerv3(pcinput)
   
     ptsnumaa = pcinputpe.shape[0]
-    pccolor = torch.from_numpy(np.load("")).cuda().float()
+    pccolor = torch.from_numpy(np.load("")).cuda().float() # shape 20000,3
     pccolorpe = pe_layerv3(pccolor)
   
-    pc = torch.from_numpy(np.load("")).unsqueeze(0).float()
+    pc = torch.from_numpy(np.load("")).unsqueeze(0).float() # shape 20000,3
     dist, _, query_knn_pc=pytorch3d.ops.knn_points(pc,pc,K=21,return_nn=True,return_sorted=False)
     dist = torch.sqrt(dist)
     _, idxcolor, _=pytorch3d.ops.knn_points(pc,pc,K=6,return_nn=True,return_sorted=False)
