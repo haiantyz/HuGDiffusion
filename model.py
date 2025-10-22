@@ -1096,6 +1096,527 @@ class PV3Align(nn.Module):
         return shs.permute(0,2,1).reshape(bs, 90000, 4, 3)
     
 import numpy as np 
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim.lr_scheduler as lr_sched
+from pointnet2_ops.pointnet2_modules import PointnetFPModule, PointnetSAModule
+from torch.utils.data import DataLoader, DistributedSampler
+from torchvision import transforms
+from model.resnet import resnet18
+from model.projectpoint import points_projection
+import numpy as np 
+import pytorch3d
+import open3d as o3d
+from local_attention import LocalAttention
+import trimesh 
+# from multiheadselfattention import Attention2D
+# from utils.general_utils import inverse_sigmoid
+from model.positionencoding import get_embedder
+def set_bn_momentum_default(bn_momentum):
+    def fn(m):
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            m.momentum = bn_momentum
+
+    return fn
+
+
+
+def projection(query_pts, R, T, K):
+    RT = torch.cat([R, T], -1)
+    RT = RT.unsqueeze(0)
+    K = K.unsqueeze(0)
+    xyz = torch.repeat_interleave(query_pts.unsqueeze(dim=1), repeats=RT.shape[1], dim=1) #[bs, view_num, , 3]
+    xyz = torch.matmul(RT[:, :, None, :, :3].float(), xyz[..., None].float()) + RT[:, :, None, :, 3:].float()
+
+    xyz = torch.matmul(K[:, :, None].float(), xyz)[..., 0]
+    xy = xyz[..., :2] / (xyz[..., 2:] + 1e-5)
+
+    return xy
+
+class Attention2D(nn.Module):
+    def __init__(self, ):
+        super(Attention2D, self).__init__()
+        self.q_fc = nn.Linear(500, 500, bias=False)
+        self.k_fc = nn.Linear(500, 500, bias=False)
+        self.v_fc = nn.Linear(500, 500, bias=False)
+        self.attention = attn = LocalAttention(
+        window_size = 512,
+        causal = True,
+        autopad = True      # auto pads both inputs and mask, then truncates output appropriately
+        )
+
+    def forward(self, x, mask):
+        q = self.q_fc(x)
+        k = self.k_fc(x)
+        v = self.v_fc(x)
+        # mask = torch.ones(1, 20000).bool().cuda()
+        out  = self.attention(q, k, v, mask = mask)
+
+        return out
+
+
+class ConditionalLinear(nn.Module):
+    def __init__(self, num_in, num_out, n_steps):
+        super(ConditionalLinear, self).__init__()
+        self.num_out = num_out
+        self.lin = nn.Conv1d(num_in, num_out, kernel_size=1)
+        self.lin2 = nn.Conv1d(num_out, num_out, kernel_size=1)
+        self.embed = nn.Embedding(n_steps, num_out)
+        self.embed.weight.data.uniform_()
+
+    def forward(self, x, t):
+        out = F.softplus(self.lin(x))
+        out = self.lin2(out)
+        bs = out.shape[0]
+        pts = out.shape[2]
+        # print(out.shape)
+        gamma = self.embed(t)
+        gamma = gamma.reshape(bs,self.num_out,1).repeat(1,1,pts)
+        
+        out = gamma * out
+        return out
+
+class ConditionalLinear2(nn.Module):
+    def __init__(self, num_in, num_out):
+        super(ConditionalLinear2, self).__init__()
+        self.num_out = num_out
+        self.lin = nn.Conv1d(num_in, num_out, kernel_size=1)
+        self.lin2 = nn.Conv1d(num_out, num_out, kernel_size=1)
+        self.time_emb = TimeLinear(32,num_out)
+
+    def forward(self, x, t):
+        out = F.softplus(self.lin(x))
+        out = F.softplus(self.lin2(out))
+        bs = out.shape[0]
+        pts = out.shape[2]
+        
+        gamma = self.time_emb(t)
+        gamma = gamma.reshape(bs,self.num_out,1).repeat(1,1,pts)
+        
+        out = gamma + out
+        return out
+
+
+class TimeLinear(nn.Module):
+    def __init__(self, num_in, num_out):
+        super(TimeLinear, self).__init__()
+        self.num_out = num_out
+        self.lin = nn.Conv1d(num_in, num_out, kernel_size=1)
+        self.lin2 = nn.Conv1d(num_out, num_out, kernel_size=1)
+
+    def forward(self, x):
+        out = F.silu(self.lin(x))
+        out = (self.lin2(out))
+        
+        return out
+
+class BNMomentumScheduler(lr_sched.LambdaLR):
+    def __init__(self, model, bn_lambda, last_epoch=-1, setter=set_bn_momentum_default):
+        if not isinstance(model, nn.Module):
+            raise RuntimeError(
+                "Class '{}' is not a PyTorch nn Module".format(type(model)._name_)
+            )
+
+        self.model = model
+        self.setter = setter
+        self.lmbd = bn_lambda
+
+        self.step(last_epoch + 1)
+        self.last_epoch = last_epoch
+
+    def step(self, epoch=None):
+        if epoch is None:
+            epoch = self.last_epoch + 1
+
+        self.last_epoch = epoch
+        self.model.apply(self.setter(self.lmbd(epoch)))
+
+    def state_dict(self):
+        return dict(last_epoch=self.last_epoch)
+
+    def load_state_dict(self, state):
+        self.last_epoch = state["last_epoch"]
+        self.step(self.last_epoch)
+
+
+lr_clip = 1e-5
+bnm_clip = 1e-2
+
+
+class PointNet2ClassificationSSG(pl.LightningModule):
+    def __init__(self):
+        super().__init__()
+
+
+        self._build_model()
+
+    def _build_model(self):
+        self.SA_modules = nn.ModuleList()
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=512,
+                radius=0.2,
+                nsample=64,
+                mlp=[3, 64, 64, 128],
+                use_xyz=True,
+            )
+        )
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=128,
+                radius=0.4,
+                nsample=64,
+                mlp=[128, 128, 128, 256],
+                use_xyz=True,
+            )
+        )
+        self.SA_modules.append(
+            PointnetSAModule(
+                mlp=[256, 256, 512, 1024], use_xyz=True
+            )
+        )
+
+        self.fc_layer = nn.Sequential(
+            nn.Linear(1024, 512, bias=False),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True),
+            nn.Linear(512, 256, bias=False),
+            nn.BatchNorm1d(256),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(256, 40),
+        )
+
+    def _break_up_pc(self, pc):
+        xyz = pc[..., 0:3].contiguous()
+        features = pc[..., 3:].transpose(1, 2).contiguous() if pc.size(-1) > 3 else None
+
+        return xyz, features
+
+    def forward(self, pointcloud):
+        r"""
+            Forward pass of the network
+
+            Parameters
+            ----------
+            pointcloud: Variable(torch.cuda.FloatTensor)
+                (B, N, 3 + input_channels) tensor
+                Point cloud to run predicts on
+                Each point in the point-cloud MUST
+                be formated as (x, y, z, features...)
+        """
+        xyz, features = self._break_up_pc(pointcloud)
+
+        for module in self.SA_modules:
+            xyz, features = module(xyz, features)
+            print(features.shape)
+        return self.fc_layer(features.squeeze(-1))
+
+    
+class PointNet2SemSegSSGwithPEDiffusion(PointNet2ClassificationSSG):
+    def _build_model(self):
+        self.SA_modules = nn.ModuleList()
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=4096,
+                radius=0.02,
+                nsample=32,
+                mlp=[305, 64, 64, 64],
+                use_xyz=True,
+            )
+        )
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=1024,
+                radius=0.04,
+                nsample=32,
+                mlp=[64, 64, 64, 128],
+                use_xyz=True,
+            )
+        )
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=64,
+                radius=0.08,
+                nsample=32,
+                mlp=[128, 128, 128, 256],
+                use_xyz=True,
+            )
+        )
+        self.SA_modules.append(
+            PointnetSAModule(
+                npoint=16,
+                radius=0.2,
+                nsample=32,
+                mlp=[256, 256, 256, 512],
+                use_xyz=True,
+            )
+        )
+        self.Time_modules1 = nn.ModuleList()
+        self.Time_modules1.append(TimeLinear(32, 64))
+        self.Time_modules1.append(TimeLinear(32, 128))
+        self.Time_modules1.append(TimeLinear(32, 256))
+        self.Time_modules1.append(TimeLinear(32, 512))
+
+        self.Time_modules2 = nn.ModuleList()
+        self.Time_modules2.append(TimeLinear(32, 128))
+        self.Time_modules2.append(TimeLinear(32, 128))
+        self.Time_modules2.append(TimeLinear(32, 256))
+        self.Time_modules2.append(TimeLinear(32, 256))
+
+        self.pelayer, _  = get_embedder(10)
+        self.global_feature_layer = PointnetSAModule(
+                mlp=[512, 512, 256, 64], use_xyz=True
+            )
+        self.FP_modules = nn.ModuleList()
+        self.FP_modules.append(PointnetFPModule(mlp=[433, 128, 128, 128]))
+        self.FP_modules.append(PointnetFPModule(mlp=[256 + 64, 256, 128]))
+        self.FP_modules.append(PointnetFPModule(mlp=[256 + 128, 256, 256]))
+        self.FP_modules.append(PointnetFPModule(mlp=[512 + 256, 256, 256]))
+        
+
+        self.attentionmodule = Attention2D()
+
+
+        self.lin1 = ConditionalLinear2(500, 256)
+        self.lin2 = ConditionalLinear2(256, 128)
+        self.lin3 = ConditionalLinear2(128, 64)
+        self.lin4 = nn.Conv1d(64, 3, 1)
+
+        
+        
+        self.resnet1 = resnet18(pretrained=True)
+        self.resnet2 = resnet18(pretrained=True)
+        self.upsample = torch.nn.Upsample(scale_factor=2, mode='bilinear')
+
+   
+
+        self.idxem = torch.nn.Conv1d(21, 16, 1)
+        self.idxem2 = torch.nn.Conv1d(16, 16, 1)
+
+        self.partem = torch.nn.Conv1d(84, 64, 1)
+        self.partem2 = torch.nn.Conv1d(64, 16, 1)
+
+        self.distem = torch.nn.Conv1d(21, 16, 1)
+        self.distem2 = torch.nn.Conv1d(16, 16, 1)
+
+        self.ybatchem = torch.nn.Conv1d(3, 16, 1)
+        self.ybatchem2 = torch.nn.Conv1d(16, 16, 1)
+        self.ybatchem3 = torch.nn.Conv1d(16, 64, 1)
+      
+        self.leaky_relu = nn.LeakyReLU()
+        RT = np.asarray([1,0,0,0,0,0,-1,0,0,1,0,3.1]).reshape(3,4)
+
+        R = RT[:,:3]
+        T = RT[:,-1].reshape(-1, 1)
+        K= np.array([[
+            711.111083984375,
+            0.0,
+            256.0
+        ],
+        [
+            0.0,
+            711.111083984375,
+            256.0
+        ],
+        [
+            0.0,
+            0.0,
+            1.0
+        ]])
+
+        self.R = torch.from_numpy(R).unsqueeze(0).cuda()
+        self.T = torch.from_numpy(T).unsqueeze(0).cuda()
+        self.K = torch.from_numpy(K).unsqueeze(0).cuda()
+
+    def forward(self, gspc, projectpc, image, imageo, projectpcback, backimage, backimageo, person, smplidx, smpldist, smplpart, y_t_batch, t, istrain):
+        r"""
+            Forward pass of the network
+
+            Parameters
+            ----------
+            pointcloud: Variable(torch.cuda.FloatTensor)
+                (B, N, 3 + input_channels) tensor
+                Point cloud to run predicts on
+                Each point in the point-cloud MUST
+                be formated as (x, y, z, features...)
+        """
+        
+
+        rgbfeature = imageo
+        
+        imagefeature = self.resnet1(image)
+        # imagefeature = self.upsample(imagefeature)
+
+        backrgbfeature = backimageo
+        if istrain:
+            backimagefeature = self.resnet2(backimage)
+        else:
+            backimagefeature = self.resnet1(backimage)
+      
+        
+        frontfeature = torch.cat([rgbfeature, imagefeature], 1)
+        backfeature = torch.cat([backrgbfeature, backimagefeature],1)
+        
+        bs = gspc.shape[0]
+        mlpinput = torch.tensor([]).cuda()
+        for i in range(bs):
+            _, visible_idx = points_projection(projectpc[i].unsqueeze(0), frontfeature[i].unsqueeze(0))
+            
+            uniqueidx = set(list(visible_idx.cpu().numpy()))
+            allidx = set(range(20000))
+            unvisible = torch.from_numpy(np.asarray(list(set(allidx).difference(set(uniqueidx))))).cuda()
+
+            visiblepc = projectpcback[i][visible_idx].unsqueeze(0)
+            unvisiblepc = projectpcback[i][unvisible].unsqueeze(0)
+            unvisiblepcssda =  torch.cat([unvisiblepc[:,:,:1],unvisiblepc[:,:,-1:]],2)
+            visiblepcssda = torch.cat([visiblepc[:,:,:1],visiblepc[:,:,-1:]],2)
+            dist, idx, query_knn_pc=pytorch3d.ops.knn_points(unvisiblepcssda, visiblepcssda,K=1,return_nn=True,return_sorted=False)
+            unvisiblepc = unvisiblepc.squeeze()
+            visiblepc = visiblepc.squeeze()
+            # print(visible_idx.shape)
+            # print(unvisible.shape)
+            newallidx = torch.cat([visible_idx, unvisible], 0)
+            newz = visiblepc[:,1][idx.squeeze().cpu().numpy()]
+            
+            newunviprojectpc = torch.cat([unvisiblepc[:,:1],newz.squeeze().unsqueeze(-1),unvisiblepc[:,-1:]],1).squeeze().unsqueeze(0)
+            # pcd = o3d.geometry.PointCloud()
+            # pcd.points = o3d.utility.Vector3dVector(newunviprojectpc.detach().cpu().squeeze().numpy())
+            
+            # o3d.io.write_point_cloud("test.ply", pcd)
+            visiblepc = visiblepc.squeeze().unsqueeze(0)
+            # projected_featuresu, _ = points_projection(newunviprojectpc.unsqueeze(0), backfeature[i].unsqueeze(0), 0.0075,10)
+            nu_uv = projection(newunviprojectpc, self.R,self.T,self.K)
+            nu_uv = 2.0 * nu_uv.type(torch.float32) / torch.Tensor([512, 512]).cuda() - 1.0
+            nu_uv = nu_uv.cuda()
+            projected_featuresu = F.grid_sample(backfeature[i].unsqueeze(0), nu_uv, mode='nearest', align_corners=True).squeeze().permute(1,0)
+            uv =  projection(visiblepc, self.R,self.T,self.K)
+            uv = 2.0 * uv.type(torch.float32) / torch.Tensor([512, 512]).cuda()  - 1.0
+            uv = uv.cuda()
+            projected_featuresv = F.grid_sample(frontfeature[i].unsqueeze(0), uv, mode='nearest', align_corners=True).squeeze().permute(1,0)
+            pc = gspc[i]
+            feat = torch.cat([projected_featuresv, projected_featuresu],0).squeeze()
+            
+            correctsortfeat = torch.zeros_like(feat).cuda()
+            correctsortfeat[newallidx] = feat
+            
+            pcpe = self.pelayer(pc)
+            colorpe = self.pelayer(correctsortfeat[...,:3])
+            # o3d.io.write_point_cloud("test2.ply", pcd)
+            tmp = torch.concat([pc,pcpe, colorpe, correctsortfeat],1).unsqueeze(0)
+            # print(tmp.shape)
+            mlpinput = torch.cat([mlpinput, tmp], 0)
+
+
+        t_emb = calc_t_emb(t,32)
+        t_emb = t_emb.unsqueeze(1).permute(0,2,1)
+        # mlpinput = mlpin 
+        
+        smplidx = self.pelayer(smplidx)
+        
+        smplidx = smplidx.permute(0,2,1)
+        smplidx = smplidx.float()
+        idxlatten = F.leaky_relu(self.idxem(smplidx))
+        idxlatten = torch.sigmoid(self.idxem2(idxlatten))
+        
+        idxlatten = idxlatten.permute(0,2,1)
+        smpldist = self.pelayer(smpldist)
+        smpldist = smpldist.permute(0,2,1)
+        distlatten = F.leaky_relu(self.distem(smpldist))
+        distlatten = F.leaky_relu(self.distem2(distlatten))
+        
+        distlatten = distlatten.permute(0,2,1)
+        smplpart = self.pelayer(smplpart)
+        smplpart = smplpart.permute(0,2,1)
+        partlatten = F.leaky_relu(self.partem(smplpart))
+        partlatten = F.leaky_relu(self.partem2(partlatten))
+        
+        partlatten = partlatten.permute(0,2,1)
+
+        y_t_batch = y_t_batch.permute(0,2,1)
+        # print(y_t_batch.shape)
+        y_t_batchlatten = F.leaky_relu(self.ybatchem(y_t_batch))
+        y_t_batchlatten = F.leaky_relu(self.ybatchem2(y_t_batchlatten))
+        y_t_batchlatten = F.leaky_relu(self.ybatchem3(y_t_batchlatten))
+        y_t_batchlatten = y_t_batchlatten.permute(0,2,1)
+
+        # print(y_t_batchlatten.shape)
+        mlpinput = torch.cat([mlpinput, distlatten, partlatten, idxlatten, y_t_batchlatten], 2)
+        # print(mlpinput.shape)
+        
+        bs = mlpinput.shape[0]
+        ptsnum = mlpinput.shape[1]
+        xyz, features = self._break_up_pc(mlpinput)
+
+        l_xyz, l_features = [xyz], [features]
+        for i in range(len(self.SA_modules)):
+            li_xyz, li_features = self.SA_modules[i](l_xyz[i], l_features[i])
+            tptsnum = li_xyz.shape[1]
+            
+            tmptime = self.Time_modules1[i](t_emb)
+            
+            tmptime = tmptime.repeat(1,1,tptsnum)
+            li_features = li_features + tmptime
+            l_xyz.append(li_xyz)
+            l_features.append(li_features)
+            
+        _, globalfeature = self.global_feature_layer(l_xyz[-1], l_features[-1])
+        
+        globalfeature = globalfeature.repeat(1,1,ptsnum)
+
+        for i in range(-1, -(len(self.FP_modules) + 1), -1):
+            l_features[i - 1] = self.FP_modules[i](
+                l_xyz[i - 1], l_xyz[i], l_features[i - 1], l_features[i]
+            )
+            tmptime = self.Time_modules2[i](t_emb)
+            
+            l_features[i - 1] = l_features[i - 1] + tmptime
+
+
+        
+        pred_feature = l_features[0]
+        pred_feature= torch.cat([pred_feature, globalfeature],1)
+
+        y_t_batch = y_t_batch.permute(0,2,1)
+        
+        finalinput = torch.cat([mlpinput.permute(0,2,1), pred_feature],1)
+        finalinput = finalinput.permute(0,2,1)
+        ptsnumss = finalinput.shape[1]
+        mask = torch.ones(1, ptsnumss).bool().cuda()
+        finalinput = self.attentionmodule(finalinput, mask)
+        finalinput = finalinput.permute(0,2,1)
+
+
+        
+        shs_dc = F.silu(self.lin1(finalinput, t_emb))
+        shs_dc = F.silu(self.lin2(shs_dc, t_emb))
+        shs_dc = F.silu(self.lin3(shs_dc, t_emb))
+        shs_dc = self.lin4(shs_dc)
+        
+        return shs_dc.permute(0,2,1).reshape(bs, ptsnum, 3)
+
+
+def calc_t_emb(ts, t_emb_dim):
+    """
+    Embed time steps into a higher dimension space
+    """
+    assert t_emb_dim % 2 == 0
+
+    # input is of shape (B) of integer time steps
+    # output is of shape (B, t_emb_dim)
+    ts = ts.unsqueeze(1)
+    half_dim = t_emb_dim // 2
+    t_emb = np.log(10000) / (half_dim - 1)
+    t_emb = torch.exp(torch.arange(half_dim) * -t_emb)
+    t_emb = t_emb.to(ts.device) # shape (half_dim)
+    # ts is of shape (B,1)
+    t_emb = ts * t_emb
+    t_emb = torch.cat((torch.sin(t_emb), torch.cos(t_emb)), 1)
+    
+    return t_emb
+   
 
 
 
