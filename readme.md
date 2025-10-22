@@ -16,3 +16,4 @@ python unifyalign_secondstage.py
 python unifyalign_inference.py
 ```
 
+Please follow [HaP](https://github.com/yztang4/HaP/tree/main) to generate the human point cloud. 
